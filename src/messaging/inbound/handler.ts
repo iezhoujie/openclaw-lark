@@ -42,6 +42,7 @@ import { type GateResult, checkMessageGate, readFeishuAllowFromStore } from './g
 import { injectInboundHandler } from './handler-registry';
 import { dispatchToAgent } from './dispatch';
 import { resolveFeishuGroupConfig, splitLegacyGroupAllowFrom } from './policy';
+import { recordMention, recordSender } from './mention-registry';
 
 const logger = larkLogger('inbound/handler');
 
@@ -97,6 +98,17 @@ export async function handleFeishuMessage(params: {
     accountId: account.accountId,
   });
 
+  // Self-echo hard filter — drop messages authored by this very bot before
+  // enrichment, gating, or dispatch. Mirrors the channel-layer filter in
+  // event-handlers.ts so alternate entrypoints into handleFeishuMessage
+  // (synthetic messages, replays, tests) don't bypass it. Skipped when
+  // botOpenId is not yet populated (startup race before bot probe resolves);
+  // the channel-layer filter and downstream bot-sender gate act as fallback.
+  if (botOpenId && ctx.senderId && ctx.senderId === botOpenId) {
+    log(`feishu[${account.accountId}]: drop self-echo message ${ctx.messageId}`);
+    return;
+  }
+
   // 3. Early reject: skip empty-text messages with no media resources.
   //    OpenClaw 2026.4.29 adds a core-side guard for this (##74634), but
   //    rejecting here avoids wasting cycles on enrichment, gate, and
@@ -118,6 +130,18 @@ export async function handleFeishuMessage(params: {
     log,
   });
   ctx = enrichedCtx;
+
+  // Feed the per-chat name→openId registry that the outbound layer uses to
+  // turn "@Name" in LLM output into a real <at user_id="ou_xxx"> element.
+  // Both the sender and any @-target observed here are valuable signal —
+  // recording them now (before the gate) means we keep learning names even
+  // for messages the gate rejects.
+  if (ctx.senderId && ctx.senderName) {
+    recordSender(ctx.chatId, ctx.senderId, ctx.senderName);
+  }
+  for (const m of ctx.mentions) {
+    if (m.openId && m.name) recordMention(ctx.chatId, m.openId, m.name);
+  }
 
   log(`feishu[${account.accountId}]: received message from ${ctx.senderId} in ${ctx.chatId} (${ctx.chatType})`);
   logger.info(`received from ${ctx.senderId} in ${ctx.chatId} (${ctx.chatType})`);

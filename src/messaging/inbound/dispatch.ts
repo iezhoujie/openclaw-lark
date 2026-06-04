@@ -31,7 +31,8 @@ import {
 import { resolveToolUseDisplayConfig } from '../../card/tool-use-config';
 import { clearToolUseTraceRun, startToolUseTraceRun } from '../../card/tool-use-trace-store';
 import { isLikelyAbortText } from '../../channel/abort-detect';
-import { isThreadCapableGroup } from '../../core/chat-info-cache';
+import { resolveFeishuReplyRouting, type FeishuReplyRouting } from './bot-content';
+import { runWithBotPeerContext } from '../outbound/bot-peer-context';
 import { isCommentTarget } from '../../core/comment-target';
 import { SYNTHETIC_VC_CHAT_ID, isSyntheticTarget } from '../../core/synthetic-target';
 import { encodeFeishuRouteTarget } from '../../core/targets';
@@ -45,8 +46,6 @@ import { dispatchPermissionNotification, dispatchSystemCommand } from './dispatc
 import {
   buildBodyForAgent,
   buildEnvelopeWithHistory,
-  buildFeishuGroupSystemPrompt,
-  buildFeishuIdentityFields,
   buildInboundPayload,
   buildMessageBody,
 } from './dispatch-builders';
@@ -207,6 +206,7 @@ async function dispatchSyntheticMessage(
 async function dispatchNormalMessage(
   dc: DispatchContext,
   ctxPayload: ReturnType<typeof LarkClient.runtime.channel.reply.finalizeInboundContext>,
+  routing: FeishuReplyRouting,
   chatHistories: Map<string, HistoryEntry[]> | undefined,
   historyKey: string | undefined,
   historyLimit: number,
@@ -263,8 +263,8 @@ async function dispatchNormalMessage(
     accountId: dc.account.accountId,
     chatType: dc.ctx.chatType,
     skipTyping,
-    replyInThread: dc.isThread,
-    threadId: dc.isThread ? dc.ctx.threadId : undefined,
+    replyInThread: routing.replyInThread,
+    threadId: routing.threadId,
     toolUseDisplay,
   });
 
@@ -280,17 +280,34 @@ async function dispatchNormalMessage(
   dc.log(`feishu[${dc.account.accountId}]: dispatching to agent (session=${effectiveSessionKey})`);
   log.info(`dispatching to agent (session=${effectiveSessionKey})`);
 
+  // When the peer is a bot in a group (routing.suppressForBotPeer), attach
+  // bot-peer context so the outbound adapter can call `ensureMention` to
+  // guarantee the peer bot receives a notification even if the LLM forgot
+  // to @-mention it. Pure no-op for human peers.
+  const withBotPeer = routing.suppressForBotPeer && dc.ctx.senderId
+    ? <T>(fn: () => Promise<T>): Promise<T> =>
+        runWithBotPeerContext(
+          {
+            peerOpenId: dc.ctx.senderId,
+            peerName: dc.ctx.senderName ?? dc.ctx.senderId,
+          },
+          fn,
+        )
+    : <T>(fn: () => Promise<T>): Promise<T> => fn();
+
   try {
-    const { queuedFinal, counts } = await dc.core.channel.reply.dispatchReplyFromConfig({
-      ctx: ctxPayload,
-      cfg: dc.accountScopedCfg,
-      dispatcher,
-      replyOptions: {
-        ...replyOptions,
-        abortSignal: abortController.signal,
-        ...(skillFilter ? { skillFilter } : {}),
-      },
-    });
+    const { queuedFinal, counts } = await withBotPeer(() =>
+      dc.core.channel.reply.dispatchReplyFromConfig({
+        ctx: ctxPayload,
+        cfg: dc.accountScopedCfg,
+        dispatcher,
+        replyOptions: {
+          ...replyOptions,
+          abortSignal: abortController.signal,
+          ...(skillFilter ? { skillFilter } : {}),
+        },
+      }),
+    );
 
     // Wait for all enqueued deliver() calls in the SDK's sendChain to
     // complete before marking the dispatch as done.  Without this,
@@ -298,7 +315,10 @@ async function dispatchNormalMessage(
     // still pending in the Promise chain, causing markFullyComplete() to
     // block it and leaving completedText incomplete — which in turn makes
     // the streaming card's final update show truncated content.
-    await dispatcher.waitForIdle();
+    //
+    // Run under withBotPeer too so any deliveries flushed during waitForIdle
+    // still see the peer context.
+    await withBotPeer(() => dispatcher.waitForIdle());
 
     markFullyComplete();
     markDispatchIdle();
@@ -356,23 +376,10 @@ export async function dispatchToAgent(params: {
   // 1. Derive shared context (including route resolution + system event)
   const dc = buildDispatchContext(params);
 
-  // 1a. Thread detection fallback for topic groups.
-  //     In topic groups (chat_mode=topic), reply events may carry root_id
-  //     without thread_id.  When threadSession is enabled, use root_id as
-  //     a synthetic threadId so replies stay inside the topic instead of
-  //     creating a new top-level message.
-  if (!dc.isThread && dc.isGroup && dc.ctx.rootId && dc.account.config?.threadSession === true) {
-    const threadCapable = await isThreadCapableGroup({
-      cfg: dc.accountScopedCfg,
-      chatId: dc.ctx.chatId,
-      accountId: dc.account.accountId,
-    });
-    if (threadCapable) {
-      log.info(`inferred thread from root_id=${dc.ctx.rootId} in topic group ${dc.ctx.chatId}`);
-      dc.isThread = true;
-      dc.ctx = { ...dc.ctx, threadId: dc.ctx.rootId };
-    }
-  }
+  // 1a. Reply routing: handles topic-group thread inference (may mutate dc)
+  //     and bot-peer suppression for bot→bot group scenarios (#32980).
+  //     See src/messaging/inbound/bot-content.ts for the full rationale.
+  const routing = await resolveFeishuReplyRouting(dc);
 
   // 1b. Resolve thread session isolation (async: may query group info API)
   if (dc.isThread && dc.ctx.threadId) {
@@ -435,13 +442,8 @@ export async function dispatchToAgent(params: {
 
   // 8. Build inbound context payload
   const isBareNewOrReset = /^\/(?:new|reset)\s*$/i.test((params.ctx.content ?? '').trim());
-  const configuredGroupPrompt = dc.isGroup
-    ? params.groupConfig?.systemPrompt?.trim() || params.defaultGroupConfig?.systemPrompt?.trim() || undefined
-    : undefined;
-  // In group chats, always inject bot-at-bot guidance (self open_id + @
-  // delivery rules), merged with any operator-configured group prompt.
   const groupSystemPrompt = dc.isGroup
-    ? buildFeishuGroupSystemPrompt(configuredGroupPrompt, params.botOpenId)
+    ? params.groupConfig?.systemPrompt?.trim() || params.defaultGroupConfig?.systemPrompt?.trim() || undefined
     : undefined;
   const originatingTo =
     isBareNewOrReset && dc.isThread
@@ -473,7 +475,6 @@ export async function dispatchToAgent(params: {
     extraFields: {
       ...params.mediaPayload,
       ...(params.extraInboundFields ?? {}),
-      ...buildFeishuIdentityFields(params.ctx, params.botOpenId),
       ...(groupSystemPrompt ? { GroupSystemPrompt: groupSystemPrompt } : {}),
       ...(dc.ctx.threadId ? { MessageThreadId: dc.ctx.threadId } : {}),
     },
@@ -524,7 +525,7 @@ export async function dispatchToAgent(params: {
         card,
         replyToMessageId: params.replyToMessageId ?? dc.ctx.messageId,
         accountId: dc.account.accountId,
-        replyInThread: dc.isThread,
+        replyInThread: routing.replyInThread,
       });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -535,7 +536,7 @@ export async function dispatchToAgent(params: {
         text: `${i18nCommandName} failed: ${errMsg}`,
         replyToMessageId: params.replyToMessageId ?? dc.ctx.messageId,
         accountId: dc.account.accountId,
-        replyInThread: dc.isThread,
+        replyInThread: routing.replyInThread,
       });
     }
     return;
@@ -568,6 +569,7 @@ export async function dispatchToAgent(params: {
     await dispatchNormalMessage(
       dc,
       ctxPayload,
+      routing,
       params.chatHistories,
       historyKey,
       params.historyLimit,

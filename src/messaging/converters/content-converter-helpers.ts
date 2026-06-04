@@ -61,8 +61,13 @@ export function buildConvertContextFromItem(
 /**
  * Resolve mention placeholders in text.
  *
- * - Bot mentions: remove the placeholder key and any preceding `@botName`
- *   entirely (with trailing whitespace).
+ * - Bot self-mention + stripBotMentions: leading-only strip. When the
+ *   self-mention sits at the very start of the message, drop it (the
+ *   `WasMentioned` envelope field already tells the agent "this message
+ *   was addressed to you", so the anchor is redundant). When it appears
+ *   mid-text, render it as plain `@Name` so the surrounding context still
+ *   reads naturally without leaving an inline anchor the LLM might echo
+ *   back into its reply.
  * - Non-bot mentions: replace the placeholder key with readable `@name`.
  */
 export function resolveMentions(text: string, ctx: ConvertContext): string {
@@ -71,14 +76,11 @@ export function resolveMentions(text: string, ctx: ConvertContext): string {
   let result = text;
   for (const [key, info] of ctx.mentions) {
     if (info.isBot && ctx.stripBotMentions) {
-      // Preserve the addressing anchor instead of deleting the self-mention.
-      // Removing "@<self>" entirely orphans any instruction bound to it (e.g.
-      // role/turn assignment in a multi-@ message), so the agent can no longer
-      // tell which clause was addressed to it. Replace with a stable marker
-      // that keeps the binding while still hiding the raw self @-entity.
-      const selfMentionMarker = '@你(本机器人)';
-      result = result.replace(new RegExp(`@${escapeRegExp(info.name)}\\s*`, 'g'), `${selfMentionMarker} `);
-      result = result.replace(new RegExp(escapeRegExp(key) + '\\s*', 'g'), `${selfMentionMarker} `).trim();
+      result = result.replace(new RegExp(escapeRegExp(key), 'g'), `@${info.name}`);
+      const leadingPattern = new RegExp(
+        `^\\s*@${escapeRegExp(info.name)}[\\s,，:：]*`,
+      );
+      result = result.replace(leadingPattern, '').trimStart();
     } else {
       result = result.replace(new RegExp(escapeRegExp(key), 'g'), `@${info.name}`);
     }

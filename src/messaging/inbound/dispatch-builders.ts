@@ -39,7 +39,16 @@ export function buildMentionAnnotation(
   ctx: MessageContext,
   sentinels?: SentinelEntry[],
 ): string | undefined {
+  // When this bot itself was @-mentioned, tell the agent explicitly. The
+  // self-mention is stripped from the body, so without this the agent has no
+  // signal that it was the addressee and may mis-attribute instructions to
+  // another mentioned party.
+  const selfMention = ctx.mentions.find((m) => m.isBot);
   const sections = [
+    selfMention
+      ? `You (${selfMention.name}, open_id: ${selfMention.openId}) were directly @mentioned in this message; ` +
+        `text adjacent to your own mention (shown as "@你(本机器人)") is addressed to you.`
+      : undefined,
     formatMentionList(nonBotMentions(ctx)),
     formatSentinelFeedback(sentinels),
   ].filter((s): s is string => !!s);

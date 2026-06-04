@@ -71,8 +71,14 @@ export function resolveMentions(text: string, ctx: ConvertContext): string {
   let result = text;
   for (const [key, info] of ctx.mentions) {
     if (info.isBot && ctx.stripBotMentions) {
-      result = result.replace(new RegExp(`@${escapeRegExp(info.name)}\\s*`, 'g'), '').trim();
-      result = result.replace(new RegExp(escapeRegExp(key) + '\\s*', 'g'), '').trim();
+      // Preserve the addressing anchor instead of deleting the self-mention.
+      // Removing "@<self>" entirely orphans any instruction bound to it (e.g.
+      // role/turn assignment in a multi-@ message), so the agent can no longer
+      // tell which clause was addressed to it. Replace with a stable marker
+      // that keeps the binding while still hiding the raw self @-entity.
+      const selfMentionMarker = '@你(本机器人)';
+      result = result.replace(new RegExp(`@${escapeRegExp(info.name)}\\s*`, 'g'), `${selfMentionMarker} `);
+      result = result.replace(new RegExp(escapeRegExp(key) + '\\s*', 'g'), `${selfMentionMarker} `).trim();
     } else {
       result = result.replace(new RegExp(escapeRegExp(key), 'g'), `@${info.name}`);
     }

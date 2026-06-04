@@ -102,8 +102,12 @@ export async function handleFeishuMessage(params: {
   //    rejecting here avoids wasting cycles on enrichment, gate, and
   //    dispatch for messages that would be silently dropped at the deliver
   //    callback anyway.
-  if (!ctx.content.trim() && ctx.resources.length === 0) {
-    log(`feishu[${account.accountId}]: empty message ${ctx.messageId} (no text, no media), skipping`);
+  //    A "bare @" (only a mention, no text/media) is a valid ping in
+  //    bot-at-bot flows — treat it as an intentional wake-up rather than an
+  //    empty message. Only drop messages that carry no text, no media, AND
+  //    no mention at all.
+  if (!ctx.content.trim() && ctx.resources.length === 0 && ctx.mentions.length === 0 && !ctx.mentionAll) {
+    log(`feishu[${account.accountId}]: empty message ${ctx.messageId} (no text, no media, no mention), skipping`);
     return;
   }
 
@@ -232,6 +236,7 @@ export async function handleFeishuMessage(params: {
       groupConfig,
       defaultGroupConfig,
       skipTyping,
+      botOpenId,
     });
   } catch (err) {
     error(`feishu[${account.accountId}]: failed to dispatch message: ${String(err)}`);

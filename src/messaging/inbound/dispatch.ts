@@ -45,6 +45,8 @@ import { dispatchPermissionNotification, dispatchSystemCommand } from './dispatc
 import {
   buildBodyForAgent,
   buildEnvelopeWithHistory,
+  buildFeishuGroupSystemPrompt,
+  buildFeishuIdentityFields,
   buildInboundPayload,
   buildMessageBody,
 } from './dispatch-builders';
@@ -348,6 +350,8 @@ export async function dispatchToAgent(params: {
   defaultGroupConfig?: FeishuGroupConfig;
   /** When true, the reply dispatcher skips typing indicators. */
   skipTyping?: boolean;
+  /** The receiving bot's own open_id, used for self-identity injection. */
+  botOpenId?: string;
 }): Promise<void> {
   // 1. Derive shared context (including route resolution + system event)
   const dc = buildDispatchContext(params);
@@ -431,8 +435,13 @@ export async function dispatchToAgent(params: {
 
   // 8. Build inbound context payload
   const isBareNewOrReset = /^\/(?:new|reset)\s*$/i.test((params.ctx.content ?? '').trim());
-  const groupSystemPrompt = dc.isGroup
+  const configuredGroupPrompt = dc.isGroup
     ? params.groupConfig?.systemPrompt?.trim() || params.defaultGroupConfig?.systemPrompt?.trim() || undefined
+    : undefined;
+  // In group chats, always inject bot-at-bot guidance (self open_id + @
+  // delivery rules), merged with any operator-configured group prompt.
+  const groupSystemPrompt = dc.isGroup
+    ? buildFeishuGroupSystemPrompt(configuredGroupPrompt, params.botOpenId)
     : undefined;
   const originatingTo =
     isBareNewOrReset && dc.isThread
@@ -464,6 +473,7 @@ export async function dispatchToAgent(params: {
     extraFields: {
       ...params.mediaPayload,
       ...(params.extraInboundFields ?? {}),
+      ...buildFeishuIdentityFields(params.ctx, params.botOpenId),
       ...(groupSystemPrompt ? { GroupSystemPrompt: groupSystemPrompt } : {}),
       ...(dc.ctx.threadId ? { MessageThreadId: dc.ctx.threadId } : {}),
     },
